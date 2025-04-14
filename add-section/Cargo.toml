@@ -1,11 +1,11 @@
 [package]
 name = "add-section"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
 authors = ["Azathothas@pkgforge.dev", "QaidVoid@pkgforge.dev"]
-description = "A tool to add a minimal Section Header to binaries with no section header"
+description = "A tool to add a minimal Section Header to binaries with no section headers"
 
 [dependencies]
 goblin = "0.9.3"

@@ -2,7 +2,15 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+
+const VERSION: &str = "0.1.2";
+fn print_version() {
+    //let cmd = env::args().next().unwrap_or_else(|| "add-section".to_string());
+    //println!("{} {}", cmd, VERSION);
+    println!("{}", VERSION);
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -26,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 2;
                 } else {
                     eprintln!("Error: {} option requires an argument", args[i]);
-                    std::process::exit(1);
+                    process::exit(1);
                 }
             },
             "-o" | "--output" => {
@@ -35,8 +43,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 2;
                 } else {
                     eprintln!("Error: {} option requires an argument", args[i]);
-                    std::process::exit(1);
+                    process::exit(1);
                 }
+            },
+            "-v" | "--version" => {
+                print_version();
+                process::exit(0);
             },
             _ => {
                 // For backward compatibility, allow positional arguments
@@ -51,18 +63,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     if input_path.is_empty() || output_path.is_empty() {
+        eprintln!("\nAdd a minimal Section Header to binaries with no section headers\n");
         eprintln!("Usage: {} [options] <input_elf> <output_elf>", args[0]);
         eprintln!("Options:");
         eprintln!("  -f, --force           Force processing even if file already has section headers");
         eprintln!("  -i, --input FILE      Input ELF file");
         eprintln!("  -o, --output FILE     Output ELF file (directories will be created if needed)");
-        std::process::exit(1);
+        eprintln!("  -v, --version         Show Version");
+        process::exit(1);
     }
     
     // Convert input path to real path to avoid symlinks
     let real_input_path = fs::canonicalize(&input_path).unwrap_or_else(|e| {
         eprintln!("Error resolving input path '{}': {}", input_path, e);
-        std::process::exit(1);
+        process::exit(1);
     });
     
     // Ensure output directory exists
@@ -70,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             fs::create_dir_all(parent).unwrap_or_else(|e| {
                 eprintln!("Error creating directory '{}': {}", parent.display(), e);
-                std::process::exit(1);
+                process::exit(1);
             });
         }
     }
@@ -79,14 +93,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut input_data = Vec::new();
     let mut input_file = fs::File::open(&real_input_path).unwrap_or_else(|e| {
         eprintln!("Error opening input file '{}': {}", real_input_path.display(), e);
-        std::process::exit(1);
+        process::exit(1);
     });
     input_file.read_to_end(&mut input_data)?;
    
     // Verify it's an ELF file by checking magic bytes
     if input_data.len() < 4 || &input_data[0..4] != &[0x7f, b'E', b'L', b'F'] {
         eprintln!("Error: Input file is not an ELF file");
-        std::process::exit(1);
+        process::exit(1);
     }
     
     // We'll create a copy of the input file and modify it
@@ -120,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check endianness matches our assumptions
     if !is_little_endian {
         eprintln!("Error: Only little endian ELF files are supported");
-        std::process::exit(1);
+        process::exit(1);
     }
     
     // Determine header size based on architecture
@@ -281,7 +295,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write to the output file
     fs::write(&output_path, output_data).unwrap_or_else(|e| {
         eprintln!("Error writing to output file '{}': {}", output_path, e);
-        std::process::exit(1);
+        process::exit(1);
     });
 
     // Set executable permissions
@@ -290,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::PermissionsExt;
         let metadata = fs::metadata(&output_path).unwrap_or_else(|e| {
             eprintln!("Error getting file metadata '{}': {}", output_path, e);
-            std::process::exit(1);
+            process::exit(1);
         });
         let mut perms = metadata.permissions();
         let mode = perms.mode();
@@ -298,7 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         perms.set_mode(mode | 0o111);
         fs::set_permissions(&output_path, perms).unwrap_or_else(|e| {
             eprintln!("Error setting file permissions '{}': {}", output_path, e);
-            std::process::exit(1);
+            process::exit(1);
         });
     }
 
