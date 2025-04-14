@@ -283,7 +283,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error writing to output file '{}': {}", output_path, e);
         std::process::exit(1);
     });
-    
+
+    // Set executable permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(&output_path).unwrap_or_else(|e| {
+            eprintln!("Error getting file metadata '{}': {}", output_path, e);
+            std::process::exit(1);
+        });
+        let mut perms = metadata.permissions();
+        let mode = perms.mode();
+        // Add executable bits for user, group and others (equivalent to chmod a+x)
+        perms.set_mode(mode | 0o111);
+        fs::set_permissions(&output_path, perms).unwrap_or_else(|e| {
+            eprintln!("Error setting file permissions '{}': {}", output_path, e);
+            std::process::exit(1);
+        });
+    }
+
     println!("Successfully added dummy section header to '{}'", output_path);
     println!("New number of sections: {}", new_num_sections);
     
