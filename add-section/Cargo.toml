@@ -1,0 +1,17 @@
+[package]
+name = "add-section"
+version = "0.1.0"
+edition = "2021"
+authors = ["Azathothas@pkgforge.dev", "QaidVoid@pkgforge.dev"]
+description = "A tool to add a minimal Section Header to binaries with no section header"
+
+[dependencies]
+goblin = "0.9.3"
+byteorder = "1.5.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true
