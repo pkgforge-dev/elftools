@@ -8,7 +8,7 @@ authors = ["Azathothas@pkgforge.dev", "QaidVoid@pkgforge.dev"]
 description = "A tool to add a minimal Section Header to binaries with no section headers"
 
 [dependencies]
-goblin = "0.9.3"
+goblin = "0.10.0"
 byteorder = "1.5.0"
 
 [profile.release]

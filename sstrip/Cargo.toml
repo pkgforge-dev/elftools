@@ -8,7 +8,7 @@ authors = ["Azathothas@pkgforge.dev", "QaidVoid@pkgforge.dev"]
 description = "A tool to remove everything not needed by a binary to run"
 
 [dependencies]
-goblin = "0.9.3"
+goblin = "0.10.0"
 
 [profile.release]
 codegen-units = 1
