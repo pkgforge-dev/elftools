@@ -8,7 +8,7 @@ authors = ["Azathothas@pkgforge.dev", "QaidVoid@pkgforge.dev"]
 description = "Check if an ELF is Statically Linked"
 
 [dependencies]
-goblin = "0.8"
+goblin = "0.10.0"
 
 [profile.release]
 codegen-units = 1
