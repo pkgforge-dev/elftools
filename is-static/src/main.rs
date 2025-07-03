@@ -508,7 +508,7 @@ fn print_usage() {
     let program_name = env::args().next().unwrap_or_else(|| "elf-static-check".to_string());
     eprintln!("Usage: {} [OPTIONS] <elf-file>", program_name);
     eprintln!();
-    eprintln!("Analyze ELF binary linking type (static vs dynamic).");
+    eprintln!("Analyze ELF binary linking type (Static/Dynamic)");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -r, --result     Show detailed analysis with evidence");
