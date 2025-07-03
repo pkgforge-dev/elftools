@@ -74,7 +74,7 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
                 // Extract interpreter path (equivalent to readelf -p '.interp')
                 let interp_offset = ph.p_offset as usize;
                 let interp_size = ph.p_filesz as usize;
-                if interp_offset < buffer.len() && interp_offset + interp_size <= buffer.len() {
+                if interp_offset < buffer.len() && interp_size > 0 && interp_offset.saturating_add(interp_size) <= buffer.len() {
                     let interp_bytes = &buffer[interp_offset..interp_offset + interp_size];
                     if let Ok(interp_str) = std::str::from_utf8(interp_bytes) {
                         let interp_clean = interp_str.trim_end_matches('\0').to_string();
@@ -155,9 +155,9 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
         (".dynamic", "Dynamic linking information"),
     ];
     
-    for (section_name, description) in &dynamic_section_names {
-        for sh in &elf.section_headers {
-            if let Some(name_str) = elf.shdr_strtab.get_at(sh.sh_name) {
+    for sh in &elf.section_headers {
+        if let Some(name_str) = elf.shdr_strtab.get_at(sh.sh_name) {
+            for (section_name, description) in &dynamic_section_names {
                 if name_str == *section_name {
                     secondary_indicators.push(format!("{}: {}", section_name, description));
                     match *section_name {
@@ -336,7 +336,8 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
 }
 
 fn print_usage() {
-    eprintln!("Usage: {} [OPTIONS] <elf-file>", env::args().next().unwrap_or_else(|| "elf-static-check".to_string()));
+    let program_name = env::args().next().unwrap_or_else(|| "elf-static-check".to_string());
+    eprintln!("Usage: {} [OPTIONS] <elf-file>", program_name);
     eprintln!();
     eprintln!("Analyze ELF binary linking type (static vs dynamic).");
     eprintln!();
@@ -352,7 +353,6 @@ fn print_usage() {
     eprintln!("  1    Binary is dynamically linked");
     eprintln!("  2    Error (file not found, invalid ELF, etc.)");
     eprintln!();
-    let program_name = env::args().next().unwrap_or_else(|| "elf-static-check".to_string());
     eprintln!("Examples:");
     eprintln!("  {} /bin/ls                    # Simple check", program_name);
     eprintln!("  {} -r /bin/ls                 # Detailed analysis", program_name);
@@ -387,16 +387,24 @@ fn main() {
                 process::exit(0);
             }
             arg if arg.starts_with('-') => {
-                eprintln!("Error: Unknown option '{}'", arg);
-                print_usage();
+                if simple {
+                    println!("error");
+                } else {
+                    eprintln!("Error: Unknown option '{}'", arg);
+                    print_usage();
+                }
                 process::exit(2);
             }
             _ => {
                 if file_path.is_empty() {
                     file_path = &args[i];
                 } else {
-                    eprintln!("Error: Multiple file paths specified");
-                    print_usage();
+                    if simple {
+                        println!("error");
+                    } else {
+                        eprintln!("Error: Multiple file paths specified");
+                        print_usage();
+                    }
                     process::exit(2);
                 }
             }
@@ -405,15 +413,23 @@ fn main() {
     }
     
     if file_path.is_empty() {
-        eprintln!("Error: No file path specified");
-        print_usage();
+        if simple {
+            println!("error");
+        } else {
+            eprintln!("Error: No file path specified");
+            print_usage();
+        }
         process::exit(2);
     }
     
     // Validate file exists and resolve to canonical path
     let path = std::path::Path::new(file_path);
     if !path.exists() {
-        eprintln!("Error: File '{}' not found", file_path);
+        if simple {
+            println!("error");
+        } else {
+            eprintln!("Error: File '{}' not found", file_path);
+        }
         process::exit(2);
     }
     
@@ -421,7 +437,11 @@ fn main() {
     let canonical_path = match path.canonicalize() {
         Ok(path) => path,
         Err(e) => {
-            eprintln!("Error: Cannot resolve path '{}': {}", file_path, e);
+            if simple {
+                println!("error");
+            } else {
+                eprintln!("Error: Cannot resolve path '{}': {}", file_path, e);
+            }
             process::exit(2);
         }
     };
