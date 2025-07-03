@@ -1,0 +1,19 @@
+[package]
+name = "is-static"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+authors = ["Azathothas@pkgforge.dev", "QaidVoid@pkgforge.dev"]
+description = "Check if an ELF is Statically Linked"
+
+[dependencies]
+goblin = "0.8"
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true
