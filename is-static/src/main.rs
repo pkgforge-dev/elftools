@@ -410,19 +410,31 @@ fn main() {
         process::exit(2);
     }
     
-    // Validate file exists and is readable
-    if !std::path::Path::new(file_path).exists() {
+    // Validate file exists and resolve to canonical path
+    let path = std::path::Path::new(file_path);
+    if !path.exists() {
         eprintln!("Error: File '{}' not found", file_path);
         process::exit(2);
     }
     
-    match analyze_elf_static_linking(file_path) {
+    // Resolve to canonical/real path
+    let canonical_path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Error: Cannot resolve path '{}': {}", file_path, e);
+            process::exit(2);
+        }
+    };
+    
+    let canonical_path_str = canonical_path.to_string_lossy();
+    
+    match analyze_elf_static_linking(&canonical_path_str) {
         Ok(result) => {
             if simple {
                 println!("{}", if result.is_static { "static" } else { "dynamic" });
             } else if verbose {
                 println!("=== ELF Static/Dynamic Analysis ===");
-                println!("File: {}", file_path);
+                println!("File: {}", canonical_path_str);
                 println!("Result: {} LINKING", if result.is_static { "STATIC" } else { "DYNAMIC" });
                 println!("Confidence: {:.1}%", result.confidence * 100.0);
                 println!();
@@ -449,7 +461,7 @@ fn main() {
                     result.confidence * 100.0);
                     
             } else if show_result || show_confidence {
-                println!("File: {}", file_path);
+                println!("File: {}", canonical_path_str);
                 println!("Linking: {}", if result.is_static { "Static" } else { "Dynamic" });
                 if show_confidence {
                     println!("Confidence: {:.1}%", result.confidence * 100.0);
@@ -464,7 +476,7 @@ fn main() {
             } else {
                 // Default output
                 println!("{}: {} (confidence: {:.1}%)", 
-                    file_path,
+                    canonical_path_str,
                     if result.is_static { "static" } else { "dynamic" },
                     result.confidence * 100.0);
             }
@@ -475,7 +487,7 @@ fn main() {
             if simple {
                 println!("error");
             } else {
-                eprintln!("Error analyzing '{}': {}", file_path, e);
+                eprintln!("Error analyzing '{}': {}", canonical_path_str, e);
             }
             process::exit(2);
         }
