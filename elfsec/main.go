@@ -13,17 +13,19 @@ import (
 )
 
 type SecurityFeatures struct {
-	ASLR        bool
-	PIE         bool
-	NXBit       bool
-	StackCanary bool
-	RELRO       string // "None", "Partial", "Full", "N/A"
-	Stripped    bool
-	Fortify     bool
-	Runpath     bool
-	Rpath       bool
-	Static      bool
-	StaticPIE   bool
+	ASLRSupport   bool   // Binary supports ASLR (PIE-compiled)
+	ASLREnabled   bool   // Kernel ASLR is enabled
+	ASLRLevel     int    // ASLR level (0, 1, 2)
+	PIE           bool
+	NXBit         bool
+	StackCanary   bool
+	RELRO         string // "None", "Partial", "Full", "N/A"
+	Stripped      bool
+	Fortify       bool
+	Runpath       bool
+	Rpath         bool
+	Static        bool
+	StaticPIE     bool
 }
 
 var (
@@ -37,7 +39,7 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "elfsec <binary>",
 		Short: "ELF Security Hardening Checker",
-		Long: `Check for various security hardening features including ASLR, PIE, NX bit,
+		Long: `Check for various security hardening features including ASLR support, PIE, NX bit,
 stack canaries, RELRO, and more.`,
 		Version: "1.0.0",
 		Args:    cobra.ExactArgs(1),
@@ -85,6 +87,11 @@ func analyzeELF(filename string) (*SecurityFeatures, error) {
 	}
 	defer file.Close()
 
+	// Validate it's actually an ELF file
+	if file.Class != elf.ELFCLASS32 && file.Class != elf.ELFCLASS64 {
+		return nil, fmt.Errorf("invalid ELF class")
+	}
+
 	features := &SecurityFeatures{
 		RELRO: "None",
 	}
@@ -93,21 +100,24 @@ func analyzeELF(filename string) (*SecurityFeatures, error) {
 	features.Static = isStaticBinary(file)
 
 	// Check PIE (Position Independent Executable)
-	features.PIE = file.Type == elf.ET_DYN
+	features.PIE = isPIEExecutable(file)
 
 	// For static binaries, PIE detection is more complex
 	if features.Static && features.PIE {
 		features.StaticPIE = true
 	}
 
-	// Check ASLR - depends on PIE and binary type
+	// Check ASLR support - depends on PIE and binary type
 	if features.Static {
-		// For static binaries, ASLR is only available with static-PIE
-		features.ASLR = features.StaticPIE
+		// For static binaries, ASLR is only supported with static-PIE
+		features.ASLRSupport = features.StaticPIE
 	} else {
-		// For dynamic binaries, PIE enables ASLR
-		features.ASLR = features.PIE
+		// For dynamic binaries, PIE enables ASLR support
+		features.ASLRSupport = features.PIE
 	}
+
+	// Check kernel ASLR status
+	features.ASLREnabled, features.ASLRLevel = checkKernelASLR()
 
 	// Check NX bit (No Execute) - look for GNU_STACK segment
 	features.NXBit = checkNXBit(file)
@@ -134,6 +144,48 @@ func analyzeELF(filename string) (*SecurityFeatures, error) {
 	}
 
 	return features, nil
+}
+
+func checkKernelASLR() (bool, int) {
+	// Try to read /proc/sys/kernel/randomize_va_space
+	data, err := os.ReadFile("/proc/sys/kernel/randomize_va_space")
+	if err != nil {
+		// If we can't read the file, we can't determine ASLR status
+		return false, -1
+	}
+
+	level := strings.TrimSpace(string(data))
+	switch level {
+	case "0":
+		return false, 0
+	case "1":
+		return true, 1
+	case "2":
+		return true, 2
+	default:
+		return false, -1
+	}
+}
+
+func isPIEExecutable(file *elf.File) bool {
+	// PIE executables are ET_DYN with entry point or PT_INTERP
+	if file.Type != elf.ET_DYN {
+		return false
+	}
+
+	// Check for program interpreter (dynamic executables)
+	for _, prog := range file.Progs {
+		if prog.Type == elf.PT_INTERP {
+			return true
+		}
+	}
+
+	// Check for entry point (static-PIE)
+	if file.Entry != 0 {
+		return true
+	}
+
+	return false
 }
 
 func isStaticBinary(file *elf.File) bool {
@@ -176,7 +228,8 @@ func checkNXBit(file *elf.File) bool {
 			return (prog.Flags & elf.PF_X) == 0
 		}
 	}
-	// If no GNU_STACK segment, assume NX is enabled (default behavior)
+	// If no GNU_STACK segment, check system default behavior
+	// Modern systems default to NX enabled, but we can't be 100% certain
 	return true
 }
 
@@ -241,6 +294,10 @@ func checkRELRO(file *elf.File) string {
 }
 
 func checkNeeded64(data []byte, order elf.Data) bool {
+	if len(data) < 16 {
+		return false
+	}
+
 	var byteOrder binary.ByteOrder
 	if order == elf.ELFDATA2LSB {
 		byteOrder = binary.LittleEndian
@@ -265,6 +322,10 @@ func checkNeeded64(data []byte, order elf.Data) bool {
 }
 
 func checkNeeded32(data []byte, order elf.Data) bool {
+	if len(data) < 8 {
+		return false
+	}
+
 	var byteOrder binary.ByteOrder
 	if order == elf.ELFDATA2LSB {
 		byteOrder = binary.LittleEndian
@@ -289,6 +350,10 @@ func checkNeeded32(data []byte, order elf.Data) bool {
 }
 
 func parseDynamic64(data []byte, order elf.Data) bool {
+	if len(data) < 16 {
+		return false
+	}
+
 	var byteOrder binary.ByteOrder
 	if order == elf.ELFDATA2LSB {
 		byteOrder = binary.LittleEndian
@@ -318,6 +383,10 @@ func parseDynamic64(data []byte, order elf.Data) bool {
 }
 
 func parseDynamic32(data []byte, order elf.Data) bool {
+	if len(data) < 8 {
+		return false
+	}
+
 	var byteOrder binary.ByteOrder
 	if order == elf.ELFDATA2LSB {
 		byteOrder = binary.LittleEndian
@@ -411,6 +480,10 @@ func checkRunpathRpath(file *elf.File) (bool, bool) {
 }
 
 func parseDynamicPaths64(data []byte, order elf.Data) (bool, bool) {
+	if len(data) < 16 {
+		return false, false
+	}
+
 	var byteOrder binary.ByteOrder
 	if order == elf.ELFDATA2LSB {
 		byteOrder = binary.LittleEndian
@@ -441,6 +514,10 @@ func parseDynamicPaths64(data []byte, order elf.Data) (bool, bool) {
 }
 
 func parseDynamicPaths32(data []byte, order elf.Data) (bool, bool) {
+	if len(data) < 8 {
+		return false, false
+	}
+
 	var byteOrder binary.ByteOrder
 	if order == elf.ELFDATA2LSB {
 		byteOrder = binary.LittleEndian
@@ -474,7 +551,9 @@ type JSONOutput struct {
 	File           string `json:"file"`
 	BinaryType     string `json:"binary_type"`
 	SecurityFeatures struct {
-		ASLR          bool   `json:"aslr"`
+		ASLRSupport   bool   `json:"aslr_support"`
+		ASLREnabled   bool   `json:"aslr_enabled"`
+		ASLRLevel     int    `json:"aslr_level"`
 		PIE           bool   `json:"pie"`
 		NXBit         bool   `json:"nx_bit"`
 		StackCanary   bool   `json:"stack_canary"`
@@ -496,7 +575,9 @@ func printJSONResults(filename string, features *SecurityFeatures) {
 		File:       filepath.Base(filename),
 		BinaryType: getBinaryType(features),
 	}
-	out.SecurityFeatures.ASLR = features.ASLR
+	out.SecurityFeatures.ASLRSupport = features.ASLRSupport
+	out.SecurityFeatures.ASLREnabled = features.ASLREnabled
+	out.SecurityFeatures.ASLRLevel = features.ASLRLevel
 	out.SecurityFeatures.PIE = features.PIE
 	out.SecurityFeatures.NXBit = features.NXBit
 	out.SecurityFeatures.StackCanary = features.StackCanary
@@ -512,7 +593,7 @@ func printJSONResults(filename string, features *SecurityFeatures) {
 
 	out.SecurityScore.Score = score
 	out.SecurityScore.Total = total
-	out.SecurityScore.Percentage = fmt.Sprintf("%.2f%%", percentage) // e.g. "87.50%"
+	out.SecurityScore.Percentage = fmt.Sprintf("%.2f%%", percentage)
 
 	jsonBytes, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
@@ -524,49 +605,74 @@ func printJSONResults(filename string, features *SecurityFeatures) {
 }
 
 func printResults(filename string, features *SecurityFeatures) {
-	fmt.Printf("ELF Security Analysis for: %s\n", filepath.Base(filename))
-	fmt.Printf("=" + strings.Repeat("=", len(filepath.Base(filename))+25) + "\n\n")
+	fmt.Printf("🔍 ELF Security Analysis for: %s\n", filepath.Base(filename))
+	fmt.Println("=================================\n")
 
-	// Binary type information
-	fmt.Printf("Binary Type: %s\n", getBinaryType(features))
-	if verboseMode {
-		fmt.Printf("Static Binary: %t\n", features.Static)
-		fmt.Printf("Static PIE: %t\n", features.StaticPIE)
-	}
+	// Binary info
+	fmt.Printf("📦 Binary Type        : %s\n", getBinaryType(features))
 	fmt.Println()
 
-	// Security features
-	fmt.Println("Security Features:")
-	fmt.Println("------------------")
+	// Security Features
+	fmt.Println("🛡️  Security Features")
+	fmt.Println("----------------------\n")
 
-	// Helper function to print status with optional brief description
+	// Formatter
 	printStatus := func(name string, enabled bool, info string, description string) {
 		var status string
 		if enabled {
-			status = "✓ ENABLED"
+			status = "✓ SUPPORTED"
 		} else {
-			status = "✗ DISABLED"
+			status = "✗ NOT SUPPORTED"
 		}
-		fmt.Printf("%-20s: %s", name, status)
 		if info != "" {
-			fmt.Printf(" (%s)", info)
+			status = fmt.Sprintf("%-17s (%s)", status, info)
+		} else {
+			status = fmt.Sprintf("%-17s", status)
 		}
 		if description != "" {
-			fmt.Printf(" - %s", description)
+			fmt.Printf("   %-20s : %-20s - %s\n", name, status, description)
+		} else {
+			fmt.Printf("   %-20s : %-20s\n", name, status)
 		}
-		fmt.Println()
 	}
 
-	printStatus("ASLR", features.ASLR, "", "makes memory addresses less predictable")
-	printStatus("PIE", features.PIE, "", "enables random binary loading for full ASLR")
-	printStatus("NX Bit", features.NXBit, "", "prevents execution on non-code memory regions")
+	// ASLR Section
+	fmt.Println("🔐 ASLR (Address Space Layout Randomization)")
+	fmt.Println("   -----------------------------------------")
+
+	printStatus("Binary Support", features.ASLRSupport, "", "binary is compiled to support ASLR")
+
+	if features.ASLRLevel >= 0 {
+		var kernelStatus string
+		switch features.ASLRLevel {
+		case 0:
+			kernelStatus = "Disabled"
+		case 1:
+			kernelStatus = "Conservative"
+		case 2:
+			kernelStatus = "Full"
+		}
+		kernelState := map[bool]string{true: "✓ ENABLED", false: "✗ DISABLED"}[features.ASLREnabled]
+		fmt.Printf("   %-20s : %-20s (%s)\n", "Kernel ASLR", kernelState, kernelStatus)
+	} else {
+		fmt.Printf("   %-20s : %-20s\n", "Kernel ASLR", "? UNKNOWN - cannot read kernel randomize_va_space")
+	}
+
+	effectiveASLR := features.ASLRSupport && features.ASLREnabled
+	fmt.Printf("   %-20s : %s\n", "Effective ASLR", map[bool]string{true: "✓ ACTIVE", false: "✗ INACTIVE"}[effectiveASLR])
+	fmt.Println()
+
+	// Other Flags
+	fmt.Println("🚧 Other Security Flags")
+	fmt.Println("   ---------------------")
+	printStatus("PIE", features.PIE, "", "position independent executable - enables full ASLR")
+	printStatus("NX Bit", features.NXBit, "", "prevents execution of non-executable memory pages")
 	printStatus("Stack Canary", features.StackCanary, "", "detects stack buffer overflows")
 
 	if features.RELRO != "N/A" {
-		relroEnabled := features.RELRO != "None"
-		printStatus("RELRO", relroEnabled, features.RELRO, "protects the GOT from modification")
+		printStatus("RELRO", features.RELRO != "None", features.RELRO, "makes GOT read-only after relocation")
 	} else {
-		fmt.Printf("%-20s: %s\n", "RELRO", "N/A (Static Binary)")
+		fmt.Printf("   %-20s : %-20s - %s\n", "RELRO", "N/A", "Static Binary")
 	}
 
 	printStatus("Stripped", features.Stripped, "", "removes symbol table, harder to reverse-engineer")
@@ -576,17 +682,18 @@ func printResults(filename string, features *SecurityFeatures) {
 		printStatus("RUNPATH", features.Runpath, "", "may affect runtime library search path")
 		printStatus("RPATH", features.Rpath, "", "deprecated, insecure search path for libraries")
 	} else {
-		fmt.Printf("%-20s: %s\n", "RUNPATH", "N/A (Static Binary)")
-		fmt.Printf("%-20s: %s\n", "RPATH", "N/A (Static Binary)")
+		fmt.Printf("   %-20s : %-20s - %s\n", "RUNPATH", "N/A", "Static Binary")
+		fmt.Printf("   %-20s : %-20s - %s\n", "RPATH", "N/A", "Static Binary")
 	}
 
-	// Security score
+	// Score
 	if showScore {
 		score := calculateScore(features)
 		total := getTotalScore(features)
 		percentage := calculatePercentage(features)
 
-		fmt.Printf("\nSecurity Score: %d/%d (%.1f%%)\n", score, total, percentage)
+		fmt.Println()
+		fmt.Printf("📊 Security Score       : %d/%d (%.1f%%)\n", score, total, percentage)
 
 		if verboseMode {
 			printScoreBreakdown(features)
@@ -595,6 +702,7 @@ func printResults(filename string, features *SecurityFeatures) {
 
 	// Recommendations
 	if showRecommendations {
+		fmt.Println()
 		printRecommendations(features)
 	}
 }
@@ -614,9 +722,11 @@ func getBinaryType(features *SecurityFeatures) string {
 func calculateScore(features *SecurityFeatures) int {
 	score := 0
 
-	if features.ASLR {
+	// Score based on effective ASLR (both support and kernel enabled)
+	if features.ASLRSupport && features.ASLREnabled {
 		score++
 	}
+
 	if features.PIE {
 		score++
 	}
@@ -628,11 +738,12 @@ func calculateScore(features *SecurityFeatures) int {
 	}
 
 	// RELRO scoring
-	if features.RELRO == "Full" {
+	switch strings.ToLower(features.RELRO) {
+	case "full":
 		score += 2
-	} else if features.RELRO == "Partial" {
+	case "partial":
 		score += 1
-	} else if features.RELRO == "N/A" {
+	case "n/a":
 		// For static binaries, RELRO is N/A, so we give full points
 		score += 2
 	}
@@ -670,7 +781,8 @@ func calculatePercentage(features *SecurityFeatures) float64 {
 func printScoreBreakdown(features *SecurityFeatures) {
 	fmt.Println("\nScore Breakdown:")
 	fmt.Println("----------------")
-	fmt.Printf("ASLR:           %s\n", getScoreSymbol(features.ASLR))
+	effectiveASLR := features.ASLRSupport && features.ASLREnabled
+	fmt.Printf("ASLR:           %s\n", getScoreSymbol(effectiveASLR))
 	fmt.Printf("PIE:            %s\n", getScoreSymbol(features.PIE))
 	fmt.Printf("NX Bit:         %s\n", getScoreSymbol(features.NXBit))
 	fmt.Printf("Stack Canary:   %s\n", getScoreSymbol(features.StackCanary))
@@ -686,6 +798,8 @@ func printScoreBreakdown(features *SecurityFeatures) {
 			relroScore = "✗✗ (0 points)"
 		}
 		fmt.Printf("RELRO:          %s\n", relroScore)
+	} else {
+		fmt.Printf("RELRO:          N/A (2 points - not applicable)\n")
 	}
 
 	fmt.Printf("Stripped:       %s\n", getScoreSymbol(features.Stripped))
@@ -693,6 +807,8 @@ func printScoreBreakdown(features *SecurityFeatures) {
 
 	if !features.Static {
 		fmt.Printf("No RUNPATH/RPATH: %s\n", getScoreSymbol(!features.Runpath && !features.Rpath))
+	} else {
+		fmt.Printf("No RUNPATH/RPATH: N/A (1 point - not applicable)\n")
 	}
 }
 
@@ -706,9 +822,14 @@ func getScoreSymbol(enabled bool) string {
 func printRecommendations(features *SecurityFeatures) {
 	recommendations := []string{}
 
-	if !features.PIE {
-		recommendations = append(recommendations, "Enable PIE: compile with -fPIE -pie")
+	if !features.ASLRSupport {
+		if !features.PIE {
+			recommendations = append(recommendations, "Enable ASLR support: compile with -fPIE -pie")
+		}
+	} else if !features.ASLREnabled && features.ASLRLevel >= 0 {
+		recommendations = append(recommendations, "Enable kernel ASLR: echo 2 | sudo tee /proc/sys/kernel/randomize_va_space")
 	}
+
 	if !features.StackCanary {
 		recommendations = append(recommendations, "Enable stack canary: compile with -fstack-protector-strong")
 	}
@@ -723,8 +844,8 @@ func printRecommendations(features *SecurityFeatures) {
 	}
 
 	if len(recommendations) > 0 {
-		fmt.Printf("\nRecommendations:\n")
-		fmt.Printf("----------------\n")
+		fmt.Printf("\n💡 Recommendations:\n")
+		fmt.Printf("-------------------\n")
 		for _, rec := range recommendations {
 			fmt.Printf("• %s\n", rec)
 		}
