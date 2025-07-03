@@ -12,6 +12,8 @@ struct StaticAnalysisResult {
     secondary_indicators: Vec<String>,
     file_size: u64,
     stripped: bool,
+    bitness: u8, // 32 or 64
+    architecture: String,
 }
 
 fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, Box<dyn std::error::Error>> {
@@ -37,34 +39,54 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
     
     // ==================== ARCHITECTURE DETECTION ====================
     
-    let arch_info = match elf.header.e_machine {
-        goblin::elf::header::EM_386 => "i386 (Intel 80386)",
-        goblin::elf::header::EM_68K => "Motorola 68000",
-        goblin::elf::header::EM_AARCH64 => "AArch64 (ARM64)",
-        goblin::elf::header::EM_ALTERA_NIOS2 => "Altera Nios II",
-        goblin::elf::header::EM_AMDGPU => "AMD GPU",
-        goblin::elf::header::EM_ARM => "ARM",
-        goblin::elf::header::EM_BPF => "eBPF",
-        goblin::elf::header::EM_CSKY => "C-SKY",
-        goblin::elf::header::EM_IA_64 => "Intel IA-64",
-        goblin::elf::header::EM_LOONGARCH => "LoongArch",
-        goblin::elf::header::EM_MICROBLAZE => "Xilinx MicroBlaze",
-        goblin::elf::header::EM_MIPS => "MIPS",
-        goblin::elf::header::EM_PARISC => "HP PA-RISC",
-        goblin::elf::header::EM_PPC64 => "PowerPC64",
-        goblin::elf::header::EM_PPC => "PowerPC",
-        goblin::elf::header::EM_RISCV => "RISC-V",
-        goblin::elf::header::EM_S390 => "IBM System/390",
-        goblin::elf::header::EM_SH => "SuperH",
-        goblin::elf::header::EM_SPARC => "SPARC",
-        goblin::elf::header::EM_SPARCV9 => "SPARC v9",
-        goblin::elf::header::EM_VAX => "VAX",
-        goblin::elf::header::EM_X86_64 => "x86_64 (AMD64)",
-        goblin::elf::header::EM_XTENSA => "Tensilica Xtensa",
-        _ => "Unknown/Other"
+    // Detect bitness from ELF class
+    let bitness = match elf.header.e_ident[4] {
+        1 => 32, // ELFCLASS32
+        2 => 64, // ELFCLASS64
+        _ => 0,  // Unknown
     };
     
-    secondary_indicators.push(format!("Architecture: {}", arch_info));
+    let (arch_info, arch_short) = match elf.header.e_machine {
+        goblin::elf::header::EM_386 => ("i386 (Intel 80386)", "i386"),
+        goblin::elf::header::EM_68K => ("Motorola 68000", "m68k"),
+        goblin::elf::header::EM_AARCH64 => ("AArch64 (ARM64)", "aarch64"),
+        goblin::elf::header::EM_ALTERA_NIOS2 => ("Altera Nios II", "nios2"),
+        goblin::elf::header::EM_AMDGPU => ("AMD GPU", "amdgpu"),
+        goblin::elf::header::EM_ARM => ("ARM", "arm"),
+        goblin::elf::header::EM_BPF => ("eBPF", "bpf"),
+        goblin::elf::header::EM_CSKY => ("C-SKY", "csky"),
+        goblin::elf::header::EM_IA_64 => ("Intel IA-64", "ia64"),
+        goblin::elf::header::EM_LOONGARCH => ("LoongArch", "loongarch"),
+        goblin::elf::header::EM_MICROBLAZE => ("Xilinx MicroBlaze", "microblaze"),
+        goblin::elf::header::EM_MIPS => ("MIPS", "mips"),
+        goblin::elf::header::EM_PARISC => ("HP PA-RISC", "parisc"),
+        goblin::elf::header::EM_PPC64 => ("PowerPC64", "ppc64"),
+        goblin::elf::header::EM_PPC => ("PowerPC", "ppc"),
+        goblin::elf::header::EM_RISCV => ("RISC-V", "riscv"),
+        goblin::elf::header::EM_S390 => ("IBM System/390", "s390"),
+        goblin::elf::header::EM_SH => ("SuperH", "sh"),
+        goblin::elf::header::EM_SPARC => ("SPARC", "sparc"),
+        goblin::elf::header::EM_SPARCV9 => ("SPARC v9", "sparcv9"),
+        goblin::elf::header::EM_VAX => ("VAX", "vax"),
+        goblin::elf::header::EM_X86_64 => ("x86_64 (AMD64)", "x86_64"),
+        goblin::elf::header::EM_XTENSA => ("Tensilica Xtensa", "xtensa"),
+        _ => ("Unknown/Other", "unknown")
+    };
+    
+    // Add architecture and bitness to indicators
+    if bitness > 0 {
+        primary_indicators.push(format!("Architecture: {}-bit {}", bitness, arch_info));
+    } else {
+        primary_indicators.push(format!("Architecture: {} (unknown bitness)", arch_info));
+    }
+    
+    // Add endianness information
+    let endianness = match elf.header.e_ident[5] {
+        1 => "little-endian",
+        2 => "big-endian",
+        _ => "unknown endianness"
+    };
+    secondary_indicators.push(format!("Endianness: {}", endianness));
     
     // ==================== PRIMARY ANALYSIS ====================
     
@@ -209,6 +231,8 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
         secondary_indicators,
         file_size,
         stripped,
+        bitness,
+        architecture: arch_short.to_string(),
     })
 }
 
@@ -491,6 +515,7 @@ fn print_usage() {
     eprintln!("  -v, --verbose    Show verbose output with all indicators");
     eprintln!("  -s, --simple     Show simple output (static/dynamic/error)");
     eprintln!("  -c, --confidence Show confidence score");
+    eprintln!("  -a, --arch       Show architecture and bitness information");
     eprintln!("  -q, --quiet      Suppress non-essential output");
     eprintln!("  -h, --help       Show this help message");
     eprintln!();
@@ -503,7 +528,8 @@ fn print_usage() {
     eprintln!("  {} /bin/ls                    # Simple check", program_name);
     eprintln!("  {} -r /bin/ls                 # Detailed analysis", program_name);
     eprintln!("  {} -v /usr/bin/gcc            # Verbose output", program_name);
-    eprintln!("  {} -c /usr/local/bin/static   # Show confidence", program_name);
+    eprintln!("  {} -a /usr/local/bin/static   # Show architecture info", program_name);
+    eprintln!("  {} -c /bin/bash               # Show confidence", program_name);
     eprintln!("  {} -q /bin/bash               # Quiet mode", program_name);
 }
 
@@ -519,6 +545,7 @@ fn main() {
     let mut verbose = false;
     let mut simple = false;
     let mut show_confidence = false;
+    let mut show_arch = false;
     let mut quiet = false;
     let mut file_path = "";
     
@@ -530,6 +557,7 @@ fn main() {
             "-v" | "--verbose" => verbose = true,
             "-s" | "--simple" => simple = true,
             "-c" | "--confidence" => show_confidence = true,
+            "-a" | "--arch" => show_arch = true,
             "-q" | "--quiet" => quiet = true,
             "-h" | "--help" => {
                 print_usage();
@@ -605,6 +633,7 @@ fn main() {
                 println!("=== ELF Static/Dynamic Analysis ===");
                 println!("File: {}", canonical_path_str);
                 println!("Result: {} LINKING", if result.is_static { "STATIC" } else { "DYNAMIC" });
+                println!("Architecture: {}-bit {}", result.bitness, result.architecture);
                 println!("Confidence: {:.1}%", result.confidence * 100.0);
                 println!("File size: {:.1} KB", result.file_size as f64 / 1024.0);
                 println!("Stripped: {}", if result.stripped { "Yes" } else { "No" });
@@ -631,9 +660,12 @@ fn main() {
                     if result.is_static { "STATICALLY" } else { "DYNAMICALLY" },
                     result.confidence * 100.0);
                     
-            } else if show_result || show_confidence {
+            } else if show_result || show_confidence || show_arch {
                 println!("File: {}", canonical_path_str);
                 println!("Linking: {}", if result.is_static { "Static" } else { "Dynamic" });
+                if show_arch {
+                    println!("Architecture: {}-bit {}", result.bitness, result.architecture);
+                }
                 if show_confidence {
                     println!("Confidence: {:.1}%", result.confidence * 100.0);
                 }
@@ -647,10 +679,12 @@ fn main() {
             } else if quiet {
                 println!("{}", if result.is_static { "static" } else { "dynamic" });
             } else {
-                // Default output
-                println!("{}: {} (confidence: {:.1}%)", 
+                // Default output with architecture info
+                println!("{}: {} {}-bit {} (confidence: {:.1}%)", 
                     canonical_path_str,
                     if result.is_static { "static" } else { "dynamic" },
+                    result.bitness,
+                    result.architecture,
                     result.confidence * 100.0);
             }
             
