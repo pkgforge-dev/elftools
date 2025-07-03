@@ -10,10 +10,13 @@ struct StaticAnalysisResult {
     confidence: f32,
     primary_indicators: Vec<String>,
     secondary_indicators: Vec<String>,
+    file_size: u64,
+    stripped: bool,
 }
 
 fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, Box<dyn std::error::Error>> {
     let buffer = fs::read(file_path)?;
+    let file_size = buffer.len() as u64;
     let elf = Elf::parse(&buffer)?;
     
     let mut evidence = Vec::new();
@@ -45,6 +48,7 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
         goblin::elf::header::EM_CSKY => "C-SKY",
         goblin::elf::header::EM_IA_64 => "Intel IA-64",
         goblin::elf::header::EM_LOONGARCH => "LoongArch",
+        goblin::elf::header::EM_MICROBLAZE => "Xilinx MicroBlaze",
         goblin::elf::header::EM_MIPS => "MIPS",
         goblin::elf::header::EM_PARISC => "HP PA-RISC",
         goblin::elf::header::EM_PPC64 => "PowerPC64",
@@ -71,15 +75,9 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
                 has_pt_interp = true;
                 primary_indicators.push("PT_INTERP program header found".to_string());
                 
-                // Extract interpreter path (equivalent to readelf -p '.interp')
-                let interp_offset = ph.p_offset as usize;
-                let interp_size = ph.p_filesz as usize;
-                if interp_offset < buffer.len() && interp_size > 0 && interp_offset.saturating_add(interp_size) <= buffer.len() {
-                    let interp_bytes = &buffer[interp_offset..interp_offset + interp_size];
-                    if let Ok(interp_str) = std::str::from_utf8(interp_bytes) {
-                        let interp_clean = interp_str.trim_end_matches('\0').to_string();
-                        primary_indicators.push(format!("Dynamic linker: {}", interp_clean));
-                    }
+                // Extract interpreter path
+                if let Ok(interp_str) = extract_interpreter_path(&buffer, ph) {
+                    primary_indicators.push(format!("Dynamic linker: {}", interp_str));
                 }
             }
             goblin::elf::program_header::PT_DYNAMIC => {
@@ -90,7 +88,7 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
         }
     }
     
-    // Check 2: Dynamic Section (Critical - equivalent to readelf --dynamic)
+    // Check 2: Dynamic Section (Critical)
     for section in &elf.section_headers {
         if section.sh_type == goblin::elf::section_header::SHT_DYNAMIC {
             has_dynamic_section = true;
@@ -99,29 +97,20 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
         }
     }
     
-    // Check 3: NEEDED entries (Most Reliable - equivalent to readelf --dynamic | grep NEEDED)
-    // This is the most reliable indicator of dynamic linking
+    // Check 3: NEEDED entries (Most Reliable)
+    let mut is_static_pie = false;
     if let Some(dynamic) = &elf.dynamic {
-        let mut needed_count = 0;
-        let mut needed_libs = Vec::new();
-        
-        for entry in dynamic.dyns.iter() {
-            if entry.d_tag == goblin::elf::dynamic::DT_NEEDED {
-                needed_count += 1;
-                has_needed_entries = true;
-                
-                // Try to get the library name from dynstrtab
-                if let Some(lib_name) = elf.dynstrtab.get_at(entry.d_val as usize) {
-                    needed_libs.push(lib_name.to_string());
-                }
-            }
-        }
-        
-        if has_needed_entries {
-            primary_indicators.push(format!("NEEDED entries: {} shared libraries", needed_count));
+        let needed_libs = extract_needed_libraries(dynamic, &elf.dynstrtab);
+        if !needed_libs.is_empty() {
+            has_needed_entries = true;
+            primary_indicators.push(format!("NEEDED entries: {} shared libraries", needed_libs.len()));
             for lib in needed_libs {
                 primary_indicators.push(format!("  → {}", lib));
             }
+        } else if has_pt_dynamic || has_dynamic_section {
+            // Has dynamic structures but no NEEDED entries = static-PIE
+            is_static_pie = true;
+            primary_indicators.push("Static-PIE detected: Dynamic structures present but no NEEDED entries".to_string());
         }
     }
     
@@ -134,175 +123,61 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
     // ==================== SECONDARY ANALYSIS ====================
     
     // Check 5: Dynamic-specific sections
-    let dynamic_section_names = [
-        (".plt", "Procedure Linkage Table"),
-        (".plt.got", "PLT for GOT entries"),
-        (".plt.sec", "PLT with security enhancements"),
-        (".got", "Global Offset Table"),
-        (".got.plt", "GOT for PLT entries"),
-        (".dynstr", "Dynamic string table"),
-        (".dynsym", "Dynamic symbol table"),
-        (".gnu.version", "Symbol versioning"),
-        (".gnu.version_r", "Version requirements"),
-        (".gnu.version_d", "Version definitions"),
-        (".rela.dyn", "Dynamic relocations (with addends)"),
-        (".rela.plt", "PLT relocations (with addends)"),
-        (".rel.dyn", "Dynamic relocations"),
-        (".rel.plt", "PLT relocations"),
-        (".hash", "Symbol hash table"),
-        (".gnu.hash", "GNU hash table"),
-        (".interp", "Interpreter information"),
-        (".dynamic", "Dynamic linking information"),
-    ];
-    
-    for sh in &elf.section_headers {
-        if let Some(name_str) = elf.shdr_strtab.get_at(sh.sh_name) {
-            for (section_name, description) in &dynamic_section_names {
-                if name_str == *section_name {
-                    secondary_indicators.push(format!("{}: {}", section_name, description));
-                    match *section_name {
-                        ".plt" | ".plt.got" | ".plt.sec" => has_plt_sections = true,
-                        ".got.plt" => {
-                            has_plt_sections = true;
-                            has_got_plt = true;
-                        }
-                        _ => {}
-                    }
-                    break;
-                }
-            }
-        }
-    }
+    let mut section_counts = std::collections::HashMap::new();
+    analyze_sections(&elf, &mut secondary_indicators, &mut section_counts, &mut has_plt_sections, &mut has_got_plt);
     
     // Check 6: Dynamic Relocations
-    let total_dynamic_relocations = elf.dynrels.len() + elf.dynrelas.len() + elf.pltrelocs.len();
-    if total_dynamic_relocations > 0 {
+    let relocation_info = analyze_relocations(&elf);
+    if relocation_info.total > 0 {
         has_dynamic_relocations = true;
-        secondary_indicators.push(format!("Dynamic relocations: {} total", total_dynamic_relocations));
+        secondary_indicators.push(format!("Dynamic relocations: {} total", relocation_info.total));
         
-        if !elf.dynrels.is_empty() {
-            secondary_indicators.push(format!("  • {} standard relocations", elf.dynrels.len()));
+        if relocation_info.standard > 0 {
+            secondary_indicators.push(format!("  • {} standard relocations", relocation_info.standard));
         }
-        if !elf.dynrelas.is_empty() {
-            secondary_indicators.push(format!("  • {} relocations with addends", elf.dynrelas.len()));
+        if relocation_info.with_addends > 0 {
+            secondary_indicators.push(format!("  • {} relocations with addends", relocation_info.with_addends));
         }
-        if !elf.pltrelocs.is_empty() {
-            secondary_indicators.push(format!("  • {} PLT relocations", elf.pltrelocs.len()));
-        }
-    }
-    
-    // Check 7: File Type Analysis
-    let file_type_info = match elf.header.e_type {
-        goblin::elf::header::ET_EXEC => {
-            if elf.header.e_entry != 0 {
-                "ET_EXEC with entry point (traditional executable)"
-            } else {
-                "ET_EXEC without entry point (unusual)"
-            }
-        }
-        goblin::elf::header::ET_DYN => {
-            if elf.header.e_entry != 0 {
-                "ET_DYN with entry point (PIE executable or shared library)"
-            } else {
-                "ET_DYN without entry point (shared library)"
-            }
-        }
-        goblin::elf::header::ET_REL => "ET_REL (relocatable object file)",
-        goblin::elf::header::ET_CORE => "ET_CORE (core dump)",
-        _ => "Unknown ELF type"
-    };
-    secondary_indicators.push(format!("File type: {}", file_type_info));
-    
-    // Check 8: Symbol Analysis
-    let static_symbol_count = elf.syms.len();
-    let dynamic_symbol_count = elf.dynsyms.len();
-    
-    if static_symbol_count > 0 {
-        secondary_indicators.push(format!("Static symbols: {}", static_symbol_count));
-    }
-    if dynamic_symbol_count > 0 {
-        secondary_indicators.push(format!("Dynamic symbols: {}", dynamic_symbol_count));
-    }
-    
-    if static_symbol_count > 0 && dynamic_symbol_count > 0 {
-        let ratio = static_symbol_count as f32 / dynamic_symbol_count as f32;
-        secondary_indicators.push(format!("Symbol ratio (static/dynamic): {:.1}", ratio));
-    }
-    
-    // Check 9: Look for common static/dynamic patterns
-    let mut has_static_patterns = false;
-    let static_patterns = [
-        ("__libc_start_main", "glibc entry point"),
-        ("_start", "program entry point"),
-        ("main", "main function"),
-        ("__static_initialization_and_destruction_0", "static initialization"),
-    ];
-    
-    for (pattern, description) in &static_patterns {
-        for sym in &elf.syms {
-            if let Some(name_str) = elf.strtab.get_at(sym.st_name) {
-                if name_str == *pattern {
-                    secondary_indicators.push(format!("Static pattern: {} ({})", pattern, description));
-                    has_static_patterns = true;
-                    break;
-                }
-            }
+        if relocation_info.plt > 0 {
+            secondary_indicators.push(format!("  • {} PLT relocations", relocation_info.plt));
         }
     }
+    
+    // File type analysis with PIE detection
+    analyze_file_type(&elf, &mut secondary_indicators, has_pt_interp, is_static_pie);
+    
+    // Check 8: Symbol Analysis with stripped detection
+    let stripped = analyze_symbols(&elf, &mut secondary_indicators);
+    
+    // Check 9: Size analysis for static vs dynamic heuristics
+    analyze_size_heuristics(file_size, &elf, &mut secondary_indicators, has_needed_entries);
     
     // ==================== DECISION LOGIC ====================
     
-    // Most reliable indicators in order of precedence:
-    // 1. NEEDED entries (readelf --dynamic | grep NEEDED)
-    // 2. PT_INTERP program header (readelf -p '.interp')
-    // 3. PT_DYNAMIC program header
-    // 4. Dynamic section presence
-    // 5. Dynamic symbols
-    
-    let is_static = if has_needed_entries {
-        // Most reliable: Has NEEDED entries -> Definitely Dynamic
-        false
-    } else if has_pt_interp {
-        // Very reliable: Has interpreter -> Dynamic
-        false
-    } else if has_pt_dynamic {
-        // Very reliable: Has PT_DYNAMIC -> Dynamic
-        false
-    } else if has_dynamic_section {
-        // Reliable: Has dynamic section -> Dynamic  
-        false
-    } else if has_dynamic_symbols {
-        // Reliable: Has dynamic symbols -> Dynamic
-        false
-    } else if has_dynamic_relocations {
-        // Less reliable: Could be static with relocations
-        false
-    } else if has_plt_sections || has_got_plt {
-        // Less reliable: PLT/GOT structures usually indicate dynamic
-        false
-    } else {
-        // No dynamic indicators found -> Static
+    // The key insight: static-PIE binaries have dynamic structures but no NEEDED entries
+    // and no PT_INTERP (no dynamic linker)
+    let is_static = if is_static_pie {
+        // Static-PIE: has dynamic structures but is actually static
         true
+    } else {
+        // Traditional logic: no dynamic linking infrastructure = static
+        !has_needed_entries && !has_pt_interp && !has_pt_dynamic && !has_dynamic_section && !has_dynamic_symbols
     };
     
-    // Calculate confidence based on the strength of indicators
-    let confidence = if has_needed_entries {
-        0.99 // Highest confidence - NEEDED entries are definitive
-    } else if has_pt_interp {
-        0.98 // Very high confidence - interpreter is definitive
-    } else if has_pt_dynamic || has_dynamic_section {
-        0.95 // High confidence based on dynamic structures
-    } else if has_dynamic_symbols {
-        0.90 // Good confidence
-    } else if has_dynamic_relocations || has_plt_sections {
-        0.85 // Moderate confidence
-    } else if is_static && has_static_patterns && dynamic_symbol_count == 0 {
-        0.90 // Good confidence for static
-    } else if is_static && static_symbol_count > 0 && dynamic_symbol_count == 0 {
-        0.85 // Moderate confidence for static
-    } else {
-        0.75 // Lower confidence
-    };
+    // Confidence calculation
+    let confidence = calculate_confidence(
+        has_needed_entries,
+        has_pt_interp,
+        has_pt_dynamic,
+        has_dynamic_section,
+        has_dynamic_symbols,
+        has_dynamic_relocations,
+        has_plt_sections,
+        is_static,
+        is_static_pie,
+        stripped,
+        &elf
+    );
     
     // Combine all evidence
     evidence.extend(primary_indicators.clone());
@@ -332,7 +207,277 @@ fn analyze_elf_static_linking(file_path: &str) -> Result<StaticAnalysisResult, B
         confidence,
         primary_indicators,
         secondary_indicators,
+        file_size,
+        stripped,
     })
+}
+
+// Helper function to extract interpreter path safely
+fn extract_interpreter_path(buffer: &[u8], ph: &goblin::elf::ProgramHeader) -> Result<String, Box<dyn std::error::Error>> {
+    let interp_offset = ph.p_offset as usize;
+    let interp_size = ph.p_filesz as usize;
+    
+    if interp_offset >= buffer.len() || interp_size == 0 {
+        return Err("Invalid interpreter offset or size".into());
+    }
+    
+    let end_offset = interp_offset.saturating_add(interp_size);
+    if end_offset > buffer.len() {
+        return Err("Interpreter data exceeds buffer".into());
+    }
+    
+    let interp_bytes = &buffer[interp_offset..end_offset];
+    let interp_str = std::str::from_utf8(interp_bytes)?;
+    Ok(interp_str.trim_end_matches('\0').to_string())
+}
+
+// Helper function to extract NEEDED libraries
+fn extract_needed_libraries(dynamic: &goblin::elf::Dynamic, dynstrtab: &goblin::strtab::Strtab) -> Vec<String> {
+    let mut needed_libs = Vec::new();
+    
+    for entry in dynamic.dyns.iter() {
+        if entry.d_tag == goblin::elf::dynamic::DT_NEEDED {
+            if let Some(lib_name) = dynstrtab.get_at(entry.d_val as usize) {
+                needed_libs.push(lib_name.to_string());
+            }
+        }
+    }
+    
+    needed_libs
+}
+
+// Relocation analysis structure
+struct RelocationInfo {
+    total: usize,
+    standard: usize,
+    with_addends: usize,
+    plt: usize,
+}
+
+fn analyze_relocations(elf: &Elf) -> RelocationInfo {
+    let standard = elf.dynrels.len();
+    let with_addends = elf.dynrelas.len();
+    let plt = elf.pltrelocs.len();
+    
+    RelocationInfo {
+        total: standard + with_addends + plt,
+        standard,
+        with_addends,
+        plt,
+    }
+}
+
+// Enhanced section analysis
+fn analyze_sections(
+    elf: &Elf,
+    secondary_indicators: &mut Vec<String>,
+    section_counts: &mut std::collections::HashMap<String, usize>,
+    has_plt_sections: &mut bool,
+    has_got_plt: &mut bool
+) {
+    let dynamic_section_names = [
+        (".plt", "Procedure Linkage Table"),
+        (".plt.got", "PLT for GOT entries"),
+        (".plt.sec", "PLT with security enhancements"),
+        (".got", "Global Offset Table"),
+        (".got.plt", "GOT for PLT entries"),
+        (".dynstr", "Dynamic string table"),
+        (".dynsym", "Dynamic symbol table"),
+        (".gnu.version", "Symbol versioning"),
+        (".gnu.version_r", "Version requirements"),
+        (".gnu.version_d", "Version definitions"),
+        (".rela.dyn", "Dynamic relocations (with addends)"),
+        (".rela.plt", "PLT relocations (with addends)"),
+        (".rel.dyn", "Dynamic relocations"),
+        (".rel.plt", "PLT relocations"),
+        (".hash", "Symbol hash table"),
+        (".gnu.hash", "GNU hash table"),
+        (".interp", "Interpreter information"),
+        (".dynamic", "Dynamic linking information"),
+    ];
+    
+    for sh in &elf.section_headers {
+        if let Some(name_str) = elf.shdr_strtab.get_at(sh.sh_name) {
+            for (section_name, description) in &dynamic_section_names {
+                if name_str == *section_name {
+                    secondary_indicators.push(format!("{}: {} (size: {} bytes)", 
+                        section_name, description, sh.sh_size));
+                    *section_counts.entry(section_name.to_string()).or_insert(0) += 1;
+                    
+                    match *section_name {
+                        ".plt" | ".plt.got" | ".plt.sec" => *has_plt_sections = true,
+                        ".got.plt" => {
+                            *has_plt_sections = true;
+                            *has_got_plt = true;
+                        }
+                        _ => {}
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Enhanced file type analysis with PIE detection
+fn analyze_file_type(elf: &Elf, secondary_indicators: &mut Vec<String>, has_pt_interp: bool, is_static_pie: bool) {
+    let file_type_info = match elf.header.e_type {
+        goblin::elf::header::ET_EXEC => {
+            if elf.header.e_entry != 0 {
+                "ET_EXEC with entry point (traditional executable)"
+            } else {
+                "ET_EXEC without entry point (unusual)"
+            }
+        }
+        goblin::elf::header::ET_DYN => {
+            if elf.header.e_entry != 0 {
+                if is_static_pie {
+                    "ET_DYN with entry point (static-PIE executable)"
+                } else if has_pt_interp {
+                    "ET_DYN with entry point (PIE executable)"
+                } else {
+                    "ET_DYN with entry point (shared library)"
+                }
+            } else {
+                "ET_DYN without entry point (shared library)"
+            }
+        }
+        goblin::elf::header::ET_REL => "ET_REL (relocatable object file)",
+        goblin::elf::header::ET_CORE => "ET_CORE (core dump)",
+        _ => "Unknown ELF type"
+    };
+    secondary_indicators.push(format!("File type: {}", file_type_info));
+}
+
+// Enhanced symbol analysis with stripped detection
+fn analyze_symbols(elf: &Elf, secondary_indicators: &mut Vec<String>) -> bool {
+    let static_symbol_count = elf.syms.len();
+    let dynamic_symbol_count = elf.dynsyms.len();
+    let mut stripped = true;
+    
+    // Check for debug symbols and common function symbols
+    let mut has_debug_symbols = false;
+    let mut has_main_symbols = false;
+    
+    for sym in &elf.syms {
+        if let Some(name_str) = elf.strtab.get_at(sym.st_name) {
+            if name_str == "main" || name_str == "_start" {
+                has_main_symbols = true;
+            }
+            if name_str.starts_with("__debug") || name_str.contains("_debug") {
+                has_debug_symbols = true;
+            }
+            if !name_str.is_empty() {
+                stripped = false;
+            }
+        }
+    }
+    
+    if static_symbol_count > 0 {
+        secondary_indicators.push(format!("Static symbols: {}", static_symbol_count));
+    }
+    if dynamic_symbol_count > 0 {
+        secondary_indicators.push(format!("Dynamic symbols: {}", dynamic_symbol_count));
+    }
+    
+    if has_debug_symbols {
+        secondary_indicators.push("Debug symbols present".to_string());
+        stripped = false;
+    }
+    
+    if has_main_symbols {
+        secondary_indicators.push("Main entry symbols present".to_string());
+    }
+    
+    secondary_indicators.push(format!("Binary: {}", if stripped { "stripped" } else { "not stripped" }));
+    
+    if static_symbol_count > 0 && dynamic_symbol_count > 0 {
+        let ratio = static_symbol_count as f32 / dynamic_symbol_count as f32;
+        secondary_indicators.push(format!("Symbol ratio (static/dynamic): {:.1}", ratio));
+    }
+    
+    stripped
+}
+
+// Size-based heuristics
+fn analyze_size_heuristics(file_size: u64, elf: &Elf, secondary_indicators: &mut Vec<String>, has_needed_entries: bool) {
+    secondary_indicators.push(format!("File size: {} bytes ({:.1} KB)", file_size, file_size as f64 / 1024.0));
+    
+    let text_section_size = elf.section_headers.iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name).map_or(false, |name| name == ".text"))
+        .map(|sh| sh.sh_size)
+        .unwrap_or(0);
+    
+    if text_section_size > 0 {
+        secondary_indicators.push(format!("Text section size: {} bytes", text_section_size));
+    }
+    
+    // Size-based heuristics
+    if !has_needed_entries {
+        if file_size > 1024 * 1024 {  // > 1MB
+            secondary_indicators.push("Large size suggests static linking".to_string());
+        } else if file_size < 50 * 1024 {  // < 50KB
+            secondary_indicators.push("Small size suggests dynamic linking".to_string());
+        }
+    }
+}
+
+// Enhanced confidence calculation - Updated signature to match function call
+fn calculate_confidence(
+    has_needed_entries: bool,
+    has_pt_interp: bool,
+    has_pt_dynamic: bool,
+    has_dynamic_section: bool,
+    has_dynamic_symbols: bool,
+    has_dynamic_relocations: bool,
+    has_plt_sections: bool,
+    is_static: bool,
+    is_static_pie: bool,
+    stripped: bool,
+    elf: &Elf
+) -> f32 {
+    if has_needed_entries {
+        0.99 // Highest confidence - NEEDED entries are definitive
+    } else if has_pt_interp {
+        0.98 // Very high confidence - interpreter is definitive
+    } else if has_pt_dynamic || has_dynamic_section {
+        0.95 // High confidence based on dynamic structures
+    } else if has_dynamic_symbols {
+        0.90 // Good confidence
+    } else if has_dynamic_relocations || has_plt_sections {
+        0.85 // Moderate confidence
+    } else if is_static {
+        // For static binaries, confidence depends on additional factors
+        let mut confidence: f32 = 0.75;
+        
+        // Handle static-PIE case
+        if is_static_pie {
+            confidence = 0.95; // High confidence for static-PIE detection
+        }
+        
+        // Increase confidence for large binaries (likely static)
+        if elf.syms.len() > 100 {
+            confidence += 0.05;
+        }
+        
+        // Decrease confidence for stripped binaries (harder to analyze)
+        if stripped {
+            confidence -= 0.05;
+        }
+        
+        // Check for static-specific patterns
+        let has_static_main = elf.syms.iter().any(|sym| {
+            elf.strtab.get_at(sym.st_name).map_or(false, |name| name == "main")
+        });
+        
+        if has_static_main {
+            confidence += 0.10;
+        }
+        
+        confidence.min(0.95_f32).max(0.60_f32)
+    } else {
+        0.70 // Lower confidence
+    }
 }
 
 fn print_usage() {
@@ -342,11 +487,12 @@ fn print_usage() {
     eprintln!("Analyze ELF binary linking type (static vs dynamic).");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  -r, --result    Show detailed analysis with evidence");
-    eprintln!("  -v, --verbose   Show verbose output with all indicators");
-    eprintln!("  -s, --simple    Show simple output (static/dynamic/error)");
+    eprintln!("  -r, --result     Show detailed analysis with evidence");
+    eprintln!("  -v, --verbose    Show verbose output with all indicators");
+    eprintln!("  -s, --simple     Show simple output (static/dynamic/error)");
     eprintln!("  -c, --confidence Show confidence score");
-    eprintln!("  -h, --help      Show this help message");
+    eprintln!("  -q, --quiet      Suppress non-essential output");
+    eprintln!("  -h, --help       Show this help message");
     eprintln!();
     eprintln!("Exit codes:");
     eprintln!("  0    Binary is statically linked");
@@ -358,6 +504,7 @@ fn print_usage() {
     eprintln!("  {} -r /bin/ls                 # Detailed analysis", program_name);
     eprintln!("  {} -v /usr/bin/gcc            # Verbose output", program_name);
     eprintln!("  {} -c /usr/local/bin/static   # Show confidence", program_name);
+    eprintln!("  {} -q /bin/bash               # Quiet mode", program_name);
 }
 
 fn main() {
@@ -372,6 +519,7 @@ fn main() {
     let mut verbose = false;
     let mut simple = false;
     let mut show_confidence = false;
+    let mut quiet = false;
     let mut file_path = "";
     
     // Parse arguments
@@ -382,6 +530,7 @@ fn main() {
             "-v" | "--verbose" => verbose = true,
             "-s" | "--simple" => simple = true,
             "-c" | "--confidence" => show_confidence = true,
+            "-q" | "--quiet" => quiet = true,
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -457,6 +606,8 @@ fn main() {
                 println!("File: {}", canonical_path_str);
                 println!("Result: {} LINKING", if result.is_static { "STATIC" } else { "DYNAMIC" });
                 println!("Confidence: {:.1}%", result.confidence * 100.0);
+                println!("File size: {:.1} KB", result.file_size as f64 / 1024.0);
+                println!("Stripped: {}", if result.stripped { "Yes" } else { "No" });
                 println!();
                 
                 if !result.primary_indicators.is_empty() {
@@ -493,6 +644,8 @@ fn main() {
                         println!("  • {}", evidence);
                     }
                 }
+            } else if quiet {
+                println!("{}", if result.is_static { "static" } else { "dynamic" });
             } else {
                 // Default output
                 println!("{}: {} (confidence: {:.1}%)", 
