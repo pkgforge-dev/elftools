@@ -3,6 +3,7 @@ package main
 import (
 	"debug/elf"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,9 +37,8 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "elfsec <binary>",
 		Short: "ELF Security Hardening Checker",
-		Long: `A comprehensive security analysis tool for ELF binaries.
-Checks for various security hardening features including ASLR, PIE, NX bit,
-stack canaries, RELRO, and more. Supports both static and dynamic binaries.`,
+		Long: `Check for various security hardening features including ASLR, PIE, NX bit,
+stack canaries, RELRO, and more.`,
 		Version: "1.0.0",
 		Args:    cobra.ExactArgs(1),
 		RunE:    runAnalysis,
@@ -470,42 +470,57 @@ func parseDynamicPaths32(data []byte, order elf.Data) (bool, bool) {
 	return hasRunpath, hasRpath
 }
 
+type JSONOutput struct {
+	File           string `json:"file"`
+	BinaryType     string `json:"binary_type"`
+	SecurityFeatures struct {
+		ASLR          bool   `json:"aslr"`
+		PIE           bool   `json:"pie"`
+		NXBit         bool   `json:"nx_bit"`
+		StackCanary   bool   `json:"stack_canary"`
+		RELRO         string `json:"relro"`
+		Stripped      bool   `json:"stripped"`
+		FortifySource bool   `json:"fortify_source"`
+		Runpath       bool   `json:"runpath"`
+		Rpath         bool   `json:"rpath"`
+	} `json:"security_features"`
+	SecurityScore struct {
+		Score      int     `json:"score"`
+		Total      int     `json:"total"`
+		Percentage string `json:"percentage"`
+	} `json:"security_score"`
+}
+
 func printJSONResults(filename string, features *SecurityFeatures) {
-	fmt.Printf(`{
-  "file": "%s",
-  "binary_type": "%s",
-  "security_features": {
-    "aslr": %t,
-    "pie": %t,
-    "nx_bit": %t,
-    "stack_canary": %t,
-    "relro": "%s",
-    "stripped": %t,
-    "fortify_source": %t,
-    "runpath": %t,
-    "rpath": %t
-  },
-  "security_score": {
-    "score": %d,
-    "total": %d,
-    "percentage": %.1f
-  }
-}`,
-		filepath.Base(filename),
-		getBinaryType(features),
-		features.ASLR,
-		features.PIE,
-		features.NXBit,
-		features.StackCanary,
-		features.RELRO,
-		features.Stripped,
-		features.Fortify,
-		features.Runpath,
-		features.Rpath,
-		calculateScore(features),
-		getTotalScore(features),
-		calculatePercentage(features),
-	)
+	out := JSONOutput{
+		File:       filepath.Base(filename),
+		BinaryType: getBinaryType(features),
+	}
+	out.SecurityFeatures.ASLR = features.ASLR
+	out.SecurityFeatures.PIE = features.PIE
+	out.SecurityFeatures.NXBit = features.NXBit
+	out.SecurityFeatures.StackCanary = features.StackCanary
+	out.SecurityFeatures.RELRO = strings.ToLower(features.RELRO)
+	out.SecurityFeatures.Stripped = features.Stripped
+	out.SecurityFeatures.FortifySource = features.Fortify
+	out.SecurityFeatures.Runpath = features.Runpath
+	out.SecurityFeatures.Rpath = features.Rpath
+
+	score := calculateScore(features)
+	total := getTotalScore(features)
+	percentage := (float64(score) / float64(total)) * 100.0
+
+	out.SecurityScore.Score = score
+	out.SecurityScore.Total = total
+	out.SecurityScore.Percentage = fmt.Sprintf("%.2f%%", percentage) // e.g. "87.50%"
+
+	jsonBytes, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		fmt.Printf("error marshaling JSON: %v\n", err)
+		return
+	}
+
+	fmt.Println(string(jsonBytes))
 }
 
 func printResults(filename string, features *SecurityFeatures) {
@@ -524,8 +539,8 @@ func printResults(filename string, features *SecurityFeatures) {
 	fmt.Println("Security Features:")
 	fmt.Println("------------------")
 
-	// Helper function to print status
-	printStatus := func(name string, enabled bool, info string) {
+	// Helper function to print status with optional brief description
+	printStatus := func(name string, enabled bool, info string, description string) {
 		var status string
 		if enabled {
 			status = "✓ ENABLED"
@@ -536,27 +551,30 @@ func printResults(filename string, features *SecurityFeatures) {
 		if info != "" {
 			fmt.Printf(" (%s)", info)
 		}
+		if description != "" {
+			fmt.Printf(" - %s", description)
+		}
 		fmt.Println()
 	}
 
-	printStatus("ASLR", features.ASLR, "")
-	printStatus("PIE", features.PIE, "")
-	printStatus("NX Bit", features.NXBit, "")
-	printStatus("Stack Canary", features.StackCanary, "")
+	printStatus("ASLR", features.ASLR, "", "makes memory addresses less predictable")
+	printStatus("PIE", features.PIE, "", "enables random binary loading for full ASLR")
+	printStatus("NX Bit", features.NXBit, "", "prevents execution on non-code memory regions")
+	printStatus("Stack Canary", features.StackCanary, "", "detects stack buffer overflows")
 
 	if features.RELRO != "N/A" {
 		relroEnabled := features.RELRO != "None"
-		printStatus("RELRO", relroEnabled, features.RELRO)
+		printStatus("RELRO", relroEnabled, features.RELRO, "protects the GOT from modification")
 	} else {
 		fmt.Printf("%-20s: %s\n", "RELRO", "N/A (Static Binary)")
 	}
 
-	printStatus("Stripped", features.Stripped, "")
-	printStatus("FORTIFY_SOURCE", features.Fortify, "")
+	printStatus("Stripped", features.Stripped, "", "removes symbol table, harder to reverse-engineer")
+	printStatus("FORTIFY_SOURCE", features.Fortify, "", "detects some buffer overflows in libc functions")
 
 	if !features.Static {
-		printStatus("RUNPATH", features.Runpath, "")
-		printStatus("RPATH", features.Rpath, "")
+		printStatus("RUNPATH", features.Runpath, "", "may affect runtime library search path")
+		printStatus("RPATH", features.Rpath, "", "deprecated, insecure search path for libraries")
 	} else {
 		fmt.Printf("%-20s: %s\n", "RUNPATH", "N/A (Static Binary)")
 		fmt.Printf("%-20s: %s\n", "RPATH", "N/A (Static Binary)")
@@ -583,13 +601,13 @@ func printResults(filename string, features *SecurityFeatures) {
 
 func getBinaryType(features *SecurityFeatures) string {
 	if features.StaticPIE {
-		return "Static PIE"
+		return "static-pie"
 	} else if features.Static {
-		return "Static"
+		return "static"
 	} else if features.PIE {
-		return "Dynamic PIE"
+		return "dynamic-pie"
 	} else {
-		return "Dynamic"
+		return "dynamic"
 	}
 }
 
@@ -614,6 +632,9 @@ func calculateScore(features *SecurityFeatures) int {
 		score += 2
 	} else if features.RELRO == "Partial" {
 		score += 1
+	} else if features.RELRO == "N/A" {
+		// For static binaries, RELRO is N/A, so we give full points
+		score += 2
 	}
 
 	if features.Stripped {
@@ -624,7 +645,10 @@ func calculateScore(features *SecurityFeatures) int {
 	}
 
 	// For dynamic binaries, not having RUNPATH/RPATH is good
-	if !features.Static && !features.Runpath && !features.Rpath {
+	// For static binaries, these are N/A, so we give the point
+	if features.Static {
+		score++ // N/A for static binaries = full points
+	} else if !features.Runpath && !features.Rpath {
 		score++
 	}
 
@@ -632,10 +656,9 @@ func calculateScore(features *SecurityFeatures) int {
 }
 
 func getTotalScore(features *SecurityFeatures) int {
-	if features.Static {
-		return 8 // ASLR, PIE, NX, Stack Canary, RELRO(2), Stripped, Fortify
-	}
-	return 9 // Add RUNPATH/RPATH for dynamic binaries
+	// Total is always 9 regardless of binary type
+	// ASLR(1) + PIE(1) + NX(1) + Stack Canary(1) + RELRO(2) + Stripped(1) + Fortify(1) + No RUNPATH/RPATH(1) = 9
+	return 9
 }
 
 func calculatePercentage(features *SecurityFeatures) float64 {
